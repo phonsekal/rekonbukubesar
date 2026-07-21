@@ -4,7 +4,7 @@ import pandas as pd
 import io
 import re
 
-app = FastAPI(title="Reconciliation System API & Web UI", version="3.0")
+app = FastAPI(title="Reconciliation System API & Web UI", version="3.1")
 
 def clean_currency(value):
     if pd.isna(value):
@@ -41,10 +41,12 @@ def clean_currency(value):
     except ValueError:
         return 0.0
 
-def format_rupiah(val: float) -> str:
-    if val < 0:
-        return f"Rp ({abs(val):,.2f})".replace(",", "X").replace(".", ",").replace("X", ".")
-    return f"Rp {val:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+def format_number_clean(val: float) -> str:
+    """Format angka tanpa 'Rp' dan tanpa ',00' (desimal). Negatif ditulis dalam kurung (123.456)"""
+    val_int = int(round(val))
+    if val_int < 0:
+        return f"({abs(val_int):,})".replace(",", ".")
+    return f"{val_int:,}".replace(",", ".")
 
 def process_reconciliation(df: pd.DataFrame, filter_mode: str = 'ALL', target_period: str = ''):
     if df.shape[1] < 12:
@@ -76,7 +78,8 @@ def process_reconciliation(df: pd.DataFrame, filter_mode: str = 'ALL', target_pe
             "total_unmatched": 0,
             "total_surplus_unmatched": 0,
             "total_deficit_unmatched": 0,
-            "columns": ['Kode Akun', 'Nama Akun', 'Tanggal Jurnal', 'Kode Periode', 'Nomor Dokumen', 'Deskripsi', 'Nilai (Rupiah)', 'Status', 'Keterangan Detail'],
+            "total_nilai_unmatched": "0",
+            "columns": ['Kode Akun', 'Nama Akun', 'Tanggal Jurnal', 'Kode Periode', 'Nomor Dokumen', 'Deskripsi', 'Nilai', 'Status', 'Keterangan Detail'],
             "data": []
         }
 
@@ -113,7 +116,13 @@ def process_reconciliation(df: pd.DataFrame, filter_mode: str = 'ALL', target_pe
             df.loc[unmatched_neg, 'Keterangan'] = f'Kelebihan Nilai Negatif (Total (+): {len_pos}, Total (-): {len_neg})'
 
     unmatched_df = df[df['Status_Rekonsiliasi'] != 'MATCHED'].copy()
-    unmatched_df['Nilai (Rupiah)'] = unmatched_df['nilai_clean'].apply(format_rupiah)
+    
+    # Hitung Total Nilai Unmatched
+    total_nilai_numeric = unmatched_df['nilai_clean'].sum()
+    total_nilai_formatted = format_number_clean(total_nilai_numeric)
+
+    # Format Nilai ke String tanpa Rp & tanpa desimal
+    unmatched_df['Nilai'] = unmatched_df['nilai_clean'].apply(format_number_clean)
 
     selected_columns = [
         col_kode_akun,
@@ -122,7 +131,7 @@ def process_reconciliation(df: pd.DataFrame, filter_mode: str = 'ALL', target_pe
         col_kode_periode,
         col_no_doc,
         col_deskripsi,
-        'Nilai (Rupiah)',
+        'Nilai',
         'Status_Rekonsiliasi',
         'Keterangan'
     ]
@@ -145,6 +154,7 @@ def process_reconciliation(df: pd.DataFrame, filter_mode: str = 'ALL', target_pe
         "total_unmatched": len(final_df),
         "total_surplus_unmatched": len(df[df['Status_Rekonsiliasi'] == 'UNMATCHED_SURPLUS']),
         "total_deficit_unmatched": len(df[df['Status_Rekonsiliasi'] == 'UNMATCHED_DEFICIT']),
+        "total_nilai_unmatched": total_nilai_formatted,
         "columns": list(final_df.columns),
         "data": final_df.fillna("").to_dict(orient='records')
     }
@@ -169,10 +179,10 @@ async def home_ui():
                 </div>
                 <div>
                     <h1 class="text-xl font-bold tracking-wide">ReconcilePro CSV</h1>
-                    <p class="text-xs text-slate-400">Deteksi Transaksi Tanpa Pasangan dengan Filter Periode</p>
+                    <p class="text-xs text-slate-400">Deteksi Transaksi Tanpa Pasangan dengan Filter Periode & Ringkasan Total</p>
                 </div>
             </div>
-            <span class="bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-xs px-3 py-1 rounded-full font-medium">FastAPI Engine v3.0</span>
+            <span class="bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-xs px-3 py-1 rounded-full font-medium">FastAPI Engine v3.1</span>
         </div>
     </header>
 
@@ -272,7 +282,7 @@ async def home_ui():
                 <div class="p-6 border-b border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                     <div>
                         <h3 class="font-bold text-slate-900 text-lg">Hasil Rekonsiliasi Transaksi Tanpa Pasangan</h3>
-                        <p class="text-xs text-slate-500" id="filterSummary">Menampilkan Ringkasan Kolom Utama Termasuk Kode Periode (Kolom H).</p>
+                        <p class="text-xs text-slate-500">Nilai ditampilkan tanpa penulisan Rp dan tanpa desimal.</p>
                     </div>
                     <div class="flex items-center gap-3">
                         <button id="btnReset" class="text-xs font-semibold px-4 py-2 border border-slate-300 rounded-lg hover:bg-slate-50 text-slate-700">
@@ -287,6 +297,7 @@ async def home_ui():
                             <tr id="tableHeader"></tr>
                         </thead>
                         <tbody id="tableBody" class="divide-y divide-slate-100 text-slate-700"></tbody>
+                        <tfoot id="tableFooter" class="bg-slate-100 font-bold border-t-2 border-slate-300 text-slate-900 sticky bottom-0"></tfoot>
                     </table>
                 </div>
             </div>
@@ -374,12 +385,16 @@ async def home_ui():
 
             const headerTr = document.getElementById('tableHeader');
             const bodyTb = document.getElementById('tableBody');
+            const footerTf = document.getElementById('tableFooter');
+            
             headerTr.innerHTML = '';
             bodyTb.innerHTML = '';
+            footerTf.innerHTML = '';
 
             if (res.data.length === 0) {
                 bodyTb.innerHTML = `<tr><td colspan="100%" class="text-center py-8 text-emerald-600 font-medium">Tidak ada transaksi tanpa pasangan yang ditemukan untuk kriteria ini.</td></tr>`;
             } else {
+                // Header
                 res.columns.forEach(col => {
                     const th = document.createElement('th');
                     th.className = "py-3 px-4 border-b border-slate-200 whitespace-nowrap";
@@ -387,6 +402,7 @@ async def home_ui():
                     headerTr.appendChild(th);
                 });
 
+                // Rows
                 res.data.forEach(row => {
                     const tr = document.createElement('tr');
                     tr.className = row.Status === 'UNMATCHED_SURPLUS' ? 'bg-emerald-50/40 hover:bg-emerald-50' : 'bg-rose-50/40 hover:bg-rose-50';
@@ -398,7 +414,7 @@ async def home_ui():
                         if (col === 'Status') {
                             const badgeColor = row[col] === 'UNMATCHED_SURPLUS' ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800';
                             td.innerHTML = `<span class="px-2 py-0.5 rounded text-[10px] font-bold ${badgeColor}">${row[col]}</span>`;
-                        } else if (col === 'Nilai (Rupiah)') {
+                        } else if (col === 'Nilai') {
                             td.innerHTML = `<span class="font-bold text-slate-900 font-mono">${row[col]}</span>`;
                         } else if (col === 'Kode Periode') {
                             td.innerHTML = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-200 text-slate-800 font-mono">${row[col]}</span>`;
@@ -411,6 +427,25 @@ async def home_ui():
                     });
                     bodyTb.appendChild(tr);
                 });
+
+                // Footer Total Row
+                const footerTr = document.createElement('tr');
+                const nilaiColIndex = res.columns.indexOf('Nilai');
+
+                res.columns.forEach((col, idx) => {
+                    const td = document.createElement('td');
+                    td.className = "py-3 px-4 uppercase text-xs";
+                    
+                    if (idx === 0) {
+                        td.innerText = "TOTAL";
+                    } else if (idx === nilaiColIndex) {
+                        td.innerHTML = `<span class="font-mono text-indigo-700 font-extrabold text-sm">${res.total_nilai_unmatched}</span>`;
+                    } else {
+                        td.innerText = "";
+                    }
+                    footerTr.appendChild(td);
+                });
+                footerTf.appendChild(footerTr);
             }
 
             uploadSection.classList.add('hidden');
