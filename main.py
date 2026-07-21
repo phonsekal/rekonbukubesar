@@ -4,7 +4,7 @@ import pandas as pd
 import io
 import re
 
-app = FastAPI(title="Reconciliation System API & Web UI", version="4.0")
+app = FastAPI(title="Reconciliation System API & Web UI", version="5.0")
 
 def clean_currency(value):
     if pd.isna(value):
@@ -62,94 +62,115 @@ def process_reconciliation(df: pd.DataFrame, filter_mode: str = 'ALL', target_pe
     col_deskripsi = df.columns[9]
     col_l_name = df.columns[11]
 
-    # Ambil nilai Kode Akun dan Nama Akun pertama kali untuk ditampilkan di atas
+    # Ambil nilai Header
     kode_akun_header = str(df[col_kode_akun].iloc[0]) if not df.empty else "-"
     nama_akun_header = str(df[col_nama_akun].iloc[0]) if not df.empty else "-"
 
     # Format Kode Periode sebagai String
     df['periode_str'] = df[col_kode_periode].astype(str).str.strip()
-
-    # Filter Periode sebelum Rekonsiliasi
-    if target_period and filter_mode != 'ALL':
-        if filter_mode == 'EXACT':
-            df = df[df['periode_str'] == target_period].copy()
-        elif filter_mode == 'UNTIL':
-            df = df[df['periode_str'] <= target_period].copy()
-
-    if df.empty:
-        return {
-            "kode_akun": kode_akun_header,
-            "nama_akun": nama_akun_header,
-            "total_rows": 0,
-            "total_unmatched": 0,
-            "total_nilai_unmatched": "0",
-            "columns": ['Tanggal Jurnal', 'Kode Periode', 'Nomor Dokumen', 'Deskripsi', 'Nilai'],
-            "data": []
-        }
-
-    # Clean & Absolute Values
     df['nilai_clean'] = df[col_l_name].apply(clean_currency)
     df['abs_val'] = df['nilai_clean'].abs()
 
-    df['Status_Rekonsiliasi'] = 'MATCHED'
+    # Siapkan penanda awal
+    df['row_id'] = df.index
+    df['matched_pair_id'] = -1
+    df['matched_period'] = ""
 
-    # Algoritma Matching 1-to-1
+    # Algoritma Global 1-to-1 Matching (Memasang data se-pemberkasan)
+    # Urutkan berdasarkan Kode Periode agar pasangan diutamakan yang berurutan
+    df = df.sort_values(by='periode_str').reset_index(drop=True)
+
     for abs_val, group in df.groupby('abs_val'):
         if abs_val == 0:
             continue
 
-        pos_indices = group[group['nilai_clean'] > 0].index.tolist()
-        neg_indices = group[group['nilai_clean'] < 0].index.tolist()
+        pos_group = group[group['nilai_clean'] > 0]
+        neg_group = group[group['nilai_clean'] < 0]
 
-        len_pos = len(pos_indices)
-        len_neg = len(neg_indices)
+        pos_indices = pos_group.index.tolist()
+        neg_indices = neg_group.index.tolist()
 
-        matched_count = min(len_pos, len_neg)
+        matched_count = min(len(pos_indices), len_neg := len(neg_indices))
 
-        unmatched_pos = pos_indices[matched_count:]
-        unmatched_neg = neg_indices[matched_count:]
+        for i in range(matched_count):
+            p_idx = pos_indices[i]
+            n_idx = neg_indices[i]
+            
+            p_period = df.loc[p_idx, 'periode_str']
+            n_period = df.loc[n_idx, 'periode_str']
 
-        if unmatched_pos:
-            df.loc[unmatched_pos, 'Status_Rekonsiliasi'] = 'UNMATCHED'
+            # Catat pasangan masing-masing
+            df.loc[p_idx, 'matched_pair_id'] = n_idx
+            df.loc[p_idx, 'matched_period'] = n_period
 
-        if unmatched_neg:
-            df.loc[unmatched_neg, 'Status_Rekonsiliasi'] = 'UNMATCHED'
+            df.loc[n_idx, 'matched_pair_id'] = p_idx
+            df.loc[n_idx, 'matched_period'] = p_period
 
-    unmatched_df = df[df['Status_Rekonsiliasi'] != 'MATCHED'].copy()
-    
-    # Hitung Total Nilai Unmatched
-    total_nilai_numeric = unmatched_df['nilai_clean'].sum()
-    total_nilai_formatted = format_number_clean(total_nilai_numeric)
+    # Pemisahan berdasarkan Filter Mode
+    if filter_mode == 'EXACT' and target_period:
+        # Hanya transaksi di periode X yang tidak punya pasangan sama sekali
+        unmatched_main = df[(df['periode_str'] == target_period) & (df['matched_pair_id'] == -1)].copy()
+        resolved_later = pd.DataFrame()
+    elif filter_mode == 'UNTIL' and target_period:
+        # Data s.d periode X
+        df_target_scope = df[df['periode_str'] <= target_period].copy()
 
-    # Format Nilai ke String tanpa Rp & tanpa desimal
-    unmatched_df['Nilai'] = unmatched_df['nilai_clean'].apply(format_number_clean)
+        # 1. Main Unmatched: Transaksi s.d periode X yang belum berpasangan sama sekali
+        unmatched_main = df_target_scope[df_target_scope['matched_pair_id'] == -1].copy()
 
-    # Hanya kolom yang diperlukan (Tanpa Kode Akun, Nama Akun, dan Status)
-    selected_columns = [
-        col_tgl_jurnal,
-        col_kode_periode,
-        col_no_doc,
-        col_deskripsi,
-        'Nilai'
-    ]
+        # 2. Resolved Later: Transaksi di s.d. periode X yang pasangannya ada di PERIODE > X
+        resolved_later = df_target_scope[
+            (df_target_scope['matched_pair_id'] != -1) & 
+            (df_target_scope['matched_period'] > target_period)
+        ].copy()
+    else:
+        # ALL Mode
+        unmatched_main = df[df['matched_pair_id'] == -1].copy()
+        resolved_later = pd.DataFrame()
 
-    final_df = unmatched_df[selected_columns].copy()
+    # Formatting Main Unmatched Table
+    unmatched_main['Nilai'] = unmatched_main['nilai_clean'].apply(format_number_clean)
+    total_main = unmatched_main['nilai_clean'].sum() if not unmatched_main.empty else 0.0
 
-    final_df = final_df.rename(columns={
+    selected_columns = [col_tgl_jurnal, col_kode_periode, col_no_doc, col_deskripsi, 'Nilai']
+    main_df_final = unmatched_main[selected_columns].rename(columns={
         col_tgl_jurnal: 'Tanggal Jurnal',
         col_kode_periode: 'Kode Periode',
         col_no_doc: 'Nomor Dokumen',
         col_deskripsi: 'Deskripsi'
-    })
+    }) if not unmatched_main.empty else pd.DataFrame(columns=['Tanggal Jurnal', 'Kode Periode', 'Nomor Dokumen', 'Deskripsi', 'Nilai'])
+
+    # Formatting Resolved Later Table
+    if not resolved_later.empty:
+        resolved_later['Nilai'] = resolved_later['nilai_clean'].apply(format_number_clean)
+        resolved_later['Penyelesaian'] = resolved_later['matched_period'].apply(lambda x: f"Selesai di Periode {x}")
+        total_resolved = resolved_later['nilai_clean'].sum()
+
+        res_columns = [col_tgl_jurnal, col_kode_periode, col_no_doc, col_deskripsi, 'Nilai', 'Penyelesaian']
+        res_df_final = resolved_later[res_columns].rename(columns={
+            col_tgl_jurnal: 'Tanggal Jurnal',
+            col_kode_periode: 'Kode Periode Transaksi',
+            col_no_doc: 'Nomor Dokumen',
+            col_deskripsi: 'Deskripsi',
+            'Penyelesaian': 'Keterangan Penyelesaian'
+        })
+    else:
+        res_df_final = pd.DataFrame()
+        total_resolved = 0.0
 
     return {
         "kode_akun": kode_akun_header,
         "nama_akun": nama_akun_header,
         "total_rows": len(df),
-        "total_unmatched": len(final_df),
-        "total_nilai_unmatched": total_nilai_formatted,
-        "columns": list(final_df.columns),
-        "data": final_df.fillna("").to_dict(orient='records')
+        "total_unmatched": len(main_df_final),
+        "total_nilai_unmatched": format_number_clean(total_main),
+        "main_columns": list(main_df_final.columns),
+        "main_data": main_df_final.fillna("").to_dict(orient='records'),
+        "has_resolved_later": not res_df_final.empty,
+        "total_resolved_later": len(res_df_final),
+        "total_nilai_resolved_later": format_number_clean(total_resolved),
+        "resolved_columns": list(res_df_final.columns) if not res_df_final.empty else [],
+        "resolved_data": res_df_final.fillna("").to_dict(orient='records') if not res_df_final.empty else []
     }
 
 @app.get("/", response_class=HTMLResponse)
@@ -168,15 +189,9 @@ async def home_ui():
             color: #e2e8f0;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
         }
-        .brand-cyan {
-            color: #00d2ff;
-        }
-        .border-dark {
-            border-color: #1e293b;
-        }
-        .bg-card {
-            background-color: #111827;
-        }
+        .brand-cyan { color: #00d2ff; }
+        .border-dark { border-color: #1e293b; }
+        .bg-card { background-color: #111827; }
     </style>
 </head>
 <body class="min-h-screen flex flex-col justify-between">
@@ -203,7 +218,7 @@ async def home_ui():
         <!-- Title & Subtitle -->
         <div class="mb-8">
             <h1 class="text-3xl font-extrabold text-white tracking-tight mb-2">Rekonsiliasi Transaksi</h1>
-            <p class="text-sm text-slate-400">Deteksi otomatis transaksi bersisa (unmatched) dari data laporan keuangan Anda.</p>
+            <p class="text-sm text-slate-400">Deteksi otomatis transaksi bersisa dan pelacakan penyelesaian lintas periode.</p>
         </div>
 
         <!-- Upload & Options Section -->
@@ -265,33 +280,56 @@ async def home_ui():
         </div>
 
         <!-- Results Section -->
-        <div id="resultSection" class="hidden space-y-6">
-            <!-- Information Header Card (Kode Akun & Nama Akun Single Display) -->
+        <div id="resultSection" class="hidden space-y-8">
+            <!-- Information Header Card -->
             <div class="bg-card border border-dark rounded-xl p-6 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
                 <div>
                     <span class="text-[10px] font-bold uppercase tracking-widest text-slate-500 block mb-1">Informasi Akun</span>
                     <h2 id="displayNamaAkun" class="text-xl font-bold text-white mb-1">-</h2>
-                    <p class="text-xs text-slate-400">Kode Akun: <span id="displayKodeAkun" class="font-mono text-[#00d2ff] font-semibold">-</span></p>
+                    <p class="text-xs text-slate-400">Kode Akun: <span id="displayKodeAkun" class="font-mono brand-cyan font-semibold">-</span></p>
                 </div>
                 <button id="btnReset" class="text-xs font-semibold px-4 py-2 border border-dark rounded-lg hover:bg-slate-800 text-slate-300 flex items-center gap-2">
                     <i class="fa-solid fa-arrow-left"></i> Upload File Lain
                 </button>
             </div>
 
-            <!-- Table Card -->
+            <!-- TABEL 1: Main Unmatched Table -->
             <div class="bg-card rounded-xl border border-dark overflow-hidden shadow-xl">
-                <div class="p-5 border-b border-dark">
-                    <h3 class="font-bold text-slate-200 text-sm">Daftar Transaksi Tanpa Pasangan</h3>
-                    <p class="text-xs text-slate-500">Nilai yang tidak menihilkan pada laporan.</p>
+                <div class="p-5 border-b border-dark flex items-center justify-between">
+                    <div>
+                        <h3 class="font-bold text-slate-200 text-sm">Daftar Transaksi Belum Memiliki Pasangan</h3>
+                        <p class="text-xs text-slate-500">Nilai yang masih murni bersisa (unmatched) pada kriteria terfilter.</p>
+                    </div>
                 </div>
 
-                <div class="overflow-x-auto max-h-[500px]">
-                    <table class="w-full text-left border-collapse text-xs" id="resultTable">
+                <div class="overflow-x-auto max-h-[450px]">
+                    <table class="w-full text-left border-collapse text-xs">
                         <thead class="bg-[#0b0f17] text-slate-400 uppercase sticky top-0 font-semibold border-b border-dark">
-                            <tr id="tableHeader"></tr>
+                            <tr id="mainTableHeader"></tr>
                         </thead>
-                        <tbody id="tableBody" class="divide-y divide-dark text-slate-300"></tbody>
-                        <tfoot id="tableFooter" class="bg-[#0b0f17] font-bold border-t border-dark text-white sticky bottom-0"></tfoot>
+                        <tbody id="mainTableBody" class="divide-y divide-dark text-slate-300"></tbody>
+                        <tfoot id="mainTableFooter" class="bg-[#0b0f17] font-bold border-t border-dark text-white sticky bottom-0"></tfoot>
+                    </table>
+                </div>
+            </div>
+
+            <!-- TABEL 2: Keterangan Penyelesaian (Resolved in Later Periods) -->
+            <div id="resolvedSection" class="hidden bg-card rounded-xl border border-dark overflow-hidden shadow-xl">
+                <div class="p-5 border-b border-dark flex items-center justify-between bg-indigo-950/20">
+                    <div>
+                        <h3 class="font-bold text-indigo-300 text-sm">Keterangan Penyelesaian (Selesai pada Periode Selanjutnya)</h3>
+                        <p class="text-xs text-slate-400">Transaksi pada rentang periode terpilih yang baru menihilkan/selesai di periode setelahnya.</p>
+                    </div>
+                    <span class="bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 text-[10px] px-2.5 py-1 rounded-full font-mono">Cross-Period Resolved</span>
+                </div>
+
+                <div class="overflow-x-auto max-h-[450px]">
+                    <table class="w-full text-left border-collapse text-xs">
+                        <thead class="bg-[#0b0f17] text-slate-400 uppercase sticky top-0 font-semibold border-b border-dark">
+                            <tr id="resolvedTableHeader"></tr>
+                        </thead>
+                        <tbody id="resolvedTableBody" class="divide-y divide-dark text-slate-300"></tbody>
+                        <tfoot id="resolvedTableFooter" class="bg-[#0b0f17] font-bold border-t border-dark text-white sticky bottom-0"></tfoot>
                     </table>
                 </div>
             </div>
@@ -314,6 +352,7 @@ async def home_ui():
         const resultSection = document.getElementById('resultSection');
         const filterMode = document.getElementById('filterMode');
         const targetPeriod = document.getElementById('targetPeriod');
+        const resolvedSection = document.getElementById('resolvedSection');
 
         filterMode.addEventListener('change', () => {
             if (filterMode.value === 'ALL') {
@@ -375,72 +414,87 @@ async def home_ui():
         });
 
         function displayResults(res) {
-            // Tampilkan Header Akun
             document.getElementById('displayKodeAkun').innerText = res.kode_akun;
             document.getElementById('displayNamaAkun').innerText = res.nama_akun;
 
-            const headerTr = document.getElementById('tableHeader');
-            const bodyTb = document.getElementById('tableBody');
-            const footerTf = document.getElementById('tableFooter');
-            
-            headerTr.innerHTML = '';
-            bodyTb.innerHTML = '';
-            footerTf.innerHTML = '';
+            // Render Table 1: Main Unmatched
+            renderTable('mainTableHeader', 'mainTableBody', 'mainTableFooter', res.main_columns, res.main_data, res.total_nilai_unmatched, false);
 
-            if (res.data.length === 0) {
-                bodyTb.innerHTML = `<tr><td colspan="100%" class="text-center py-10 text-emerald-400 font-medium">Tidak ada transaksi tanpa pasangan yang ditemukan (100% Matched).</td></tr>`;
+            // Render Table 2: Resolved Later (jika ada)
+            if (res.has_resolved_later) {
+                renderTable('resolvedTableHeader', 'resolvedTableBody', 'resolvedTableFooter', res.resolved_columns, res.resolved_data, res.total_nilai_resolved_later, true);
+                resolvedSection.classList.remove('hidden');
             } else {
-                // Header
-                res.columns.forEach(col => {
-                    const th = document.createElement('th');
-                    th.className = "py-3.5 px-4 border-b border-dark whitespace-nowrap text-[11px] tracking-wider";
-                    th.innerText = col;
-                    headerTr.appendChild(th);
-                });
-
-                // Rows
-                res.data.forEach(row => {
-                    const tr = document.createElement('tr');
-                    tr.className = 'hover:bg-slate-800/40 transition-colors';
-
-                    res.columns.forEach(col => {
-                        const td = document.createElement('td');
-                        td.className = "py-3 px-4 whitespace-nowrap border-b border-dark/50";
-                        
-                        if (col === 'Nilai') {
-                            td.innerHTML = `<span class="font-bold text-white font-mono">${row[col]}</span>`;
-                        } else if (col === 'Kode Periode') {
-                            td.innerHTML = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-300 font-mono">${row[col]}</span>`;
-                        } else {
-                            td.innerText = row[col] !== null ? row[col] : '';
-                        }
-                        tr.appendChild(td);
-                    });
-                    bodyTb.appendChild(tr);
-                });
-
-                // Footer Total Row
-                const footerTr = document.createElement('tr');
-                const nilaiColIndex = res.columns.indexOf('Nilai');
-
-                res.columns.forEach((col, idx) => {
-                    const td = document.createElement('td');
-                    td.className = "py-3.5 px-4 uppercase text-xs";
-                    
-                    if (idx === 0) {
-                        td.innerText = "TOTAL";
-                    } else if (idx === nilaiColIndex) {
-                        td.innerHTML = `<span class="font-mono brand-cyan font-bold text-sm">${res.total_nilai_unmatched}</span>`;
-                    } else {
-                        td.innerText = "";
-                    }
-                    footerTr.appendChild(td);
-                });
-                footerTf.appendChild(footerTr);
+                resolvedSection.classList.add('hidden');
             }
 
             uploadSection.classList.add('hidden');
             resultSection.classList.remove('hidden');
+        }
+
+        function renderTable(headerId, bodyId, footerId, columns, data, totalFormatted, isResolved) {
+            const headerTr = document.getElementById(headerId);
+            const bodyTb = document.getElementById(bodyId);
+            const footerTf = document.getElementById(footerId);
+
+            headerTr.innerHTML = '';
+            bodyTb.innerHTML = '';
+            footerTf.innerHTML = '';
+
+            if (data.length === 0) {
+                bodyTb.innerHTML = `<tr><td colspan="100%" class="text-center py-8 text-emerald-400 font-medium">Tidak ada data transaksi.</td></tr>`;
+                return;
+            }
+
+            // Headers
+            columns.forEach(col => {
+                const th = document.createElement('th');
+                th.className = "py-3.5 px-4 border-b border-dark whitespace-nowrap text-[11px] tracking-wider";
+                th.innerText = col;
+                headerTr.appendChild(th);
+            });
+
+            // Rows
+            data.forEach(row => {
+                const tr = document.createElement('tr');
+                tr.className = 'hover:bg-slate-800/40 transition-colors';
+
+                columns.forEach(col => {
+                    const td = document.createElement('td');
+                    td.className = "py-3 px-4 whitespace-nowrap border-b border-dark/50";
+
+                    if (col === 'Nilai') {
+                        td.innerHTML = `<span class="font-bold text-white font-mono">${row[col]}</span>`;
+                    } else if (col === 'Kode Periode' || col === 'Kode Periode Transaksi') {
+                        td.innerHTML = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-300 font-mono">${row[col]}</span>`;
+                    } else if (col === 'Keterangan Penyelesaian') {
+                        td.innerHTML = `<span class="px-2.5 py-1 rounded text-[10px] font-semibold bg-indigo-950/60 text-indigo-300 border border-indigo-800/50 font-mono"><i class="fa-solid fa-circle-check text-indigo-400 mr-1"></i>${row[col]}</span>`;
+                    } else {
+                        td.innerText = row[col] !== null ? row[col] : '';
+                    }
+                    tr.appendChild(td);
+                });
+                bodyTb.appendChild(tr);
+            });
+
+            // Footer
+            const footerTr = document.createElement('tr');
+            const nilaiColIndex = columns.indexOf('Nilai');
+
+            columns.forEach((col, idx) => {
+                const td = document.createElement('td');
+                td.className = "py-3.5 px-4 uppercase text-xs";
+
+                if (idx === 0) {
+                    td.innerText = "TOTAL";
+                } else if (idx === nilaiColIndex) {
+                    td.innerHTML = `<span class="font-mono brand-cyan font-bold text-sm">${totalFormatted}</span>`;
+                } else {
+                    td.innerText = "";
+                }
+                footerTr.appendChild(td);
+            });
+            footerTf.appendChild(footerTr);
         }
 
         document.getElementById('btnReset').addEventListener('click', () => {
