@@ -4,7 +4,7 @@ import pandas as pd
 import io
 import re
 
-app = FastAPI(title="Reconciliation System API & Web UI", version="5.0")
+app = FastAPI(title="Reconciliation System API & Web UI", version="6.0")
 
 def clean_currency(value):
     if pd.isna(value):
@@ -42,7 +42,7 @@ def clean_currency(value):
         return 0.0
 
 def format_number_clean(val: float) -> str:
-    """Format angka tanpa 'Rp' dan tanpa ',00' (desimal). Negatif ditulis dalam kurung (123.456)"""
+    """Format angka tanpa 'Rp' dan tanpa desimal. Negatif ditulis dalam kurung (123.456)"""
     val_int = int(round(val))
     if val_int < 0:
         return f"({abs(val_int):,})".replace(",", ".")
@@ -62,98 +62,106 @@ def process_reconciliation(df: pd.DataFrame, filter_mode: str = 'ALL', target_pe
     col_deskripsi = df.columns[9]
     col_l_name = df.columns[11]
 
-    # Ambil nilai Header
+    # Header Akun
     kode_akun_header = str(df[col_kode_akun].iloc[0]) if not df.empty else "-"
     nama_akun_header = str(df[col_nama_akun].iloc[0]) if not df.empty else "-"
 
-    # Format Kode Periode sebagai String
+    # Preprocessing
     df['periode_str'] = df[col_kode_periode].astype(str).str.strip()
     df['nilai_clean'] = df[col_l_name].apply(clean_currency)
     df['abs_val'] = df['nilai_clean'].abs()
 
-    # Siapkan penanda awal
-    df['row_id'] = df.index
-    df['matched_pair_id'] = -1
-    df['matched_period'] = ""
-
-    # Algoritma Global 1-to-1 Matching (Memasang data se-pemberkasan)
-    # Urutkan berdasarkan Kode Periode agar pasangan diutamakan yang berurutan
+    # Sort berdasarkan Periode untuk memastikan pencocokan kronologis
     df = df.sort_values(by='periode_str').reset_index(drop=True)
+    df['row_id'] = df.index
 
+    # -------------------------------------------------------------
+    # 1. PENCOCOKAN DALAM SKOP CAKUPAN (Scope Matching) -> Untuk Tabel Utama
+    # -------------------------------------------------------------
+    if filter_mode == 'EXACT' and target_period:
+        scope_df = df[df['periode_str'] == target_period].copy()
+    elif filter_mode == 'UNTIL' and target_period:
+        scope_df = df[df['periode_str'] <= target_period].copy()
+    else:
+        scope_df = df.copy()
+
+    scope_df['matched_in_scope'] = False
+
+    for abs_val, group in scope_df.groupby('abs_val'):
+        if abs_val == 0:
+            continue
+        pos_indices = group[group['nilai_clean'] > 0].index.tolist()
+        neg_indices = group[group['nilai_clean'] < 0].index.tolist()
+        matched_cnt = min(len(pos_indices), len(neg_indices))
+
+        for i in range(matched_cnt):
+            scope_df.loc[pos_indices[i], 'matched_in_scope'] = True
+            scope_df.loc[neg_indices[i], 'matched_in_scope'] = True
+
+    # Main Unmatched = Semua baris yang belum dapat pasangan DI DALAM SKOP PERIODE TERPILIH
+    unmatched_main = scope_df[~scope_df['matched_in_scope']].copy()
+
+    # -------------------------------------------------------------
+    # 2. PENCOCOKAN GLOBAL (Seluruh Periode) -> Untuk Tabel Pasangan Lintas Periode
+    # -------------------------------------------------------------
+    df['matched_pair_id'] = -1
     for abs_val, group in df.groupby('abs_val'):
         if abs_val == 0:
             continue
+        pos_indices = group[group['nilai_clean'] > 0].index.tolist()
+        neg_indices = group[group['nilai_clean'] < 0].index.tolist()
+        matched_cnt = min(len(pos_indices), len(neg_indices))
 
-        pos_group = group[group['nilai_clean'] > 0]
-        neg_group = group[group['nilai_clean'] < 0]
-
-        pos_indices = pos_group.index.tolist()
-        neg_indices = neg_group.index.tolist()
-
-        matched_count = min(len(pos_indices), len_neg := len(neg_indices))
-
-        for i in range(matched_count):
+        for i in range(matched_cnt):
             p_idx = pos_indices[i]
             n_idx = neg_indices[i]
-            
-            p_period = df.loc[p_idx, 'periode_str']
-            n_period = df.loc[n_idx, 'periode_str']
-
-            # Catat pasangan masing-masing
             df.loc[p_idx, 'matched_pair_id'] = n_idx
-            df.loc[p_idx, 'matched_period'] = n_period
-
             df.loc[n_idx, 'matched_pair_id'] = p_idx
-            df.loc[n_idx, 'matched_period'] = p_period
 
-    # Pemisahan berdasarkan Filter Mode
-    if filter_mode == 'EXACT' and target_period:
-        # Hanya transaksi di periode X yang tidak punya pasangan sama sekali
-        unmatched_main = df[(df['periode_str'] == target_period) & (df['matched_pair_id'] == -1)].copy()
-        resolved_later = pd.DataFrame()
-    elif filter_mode == 'UNTIL' and target_period:
-        # Data s.d periode X
-        df_target_scope = df[df['periode_str'] <= target_period].copy()
+    # Cari transaksi di Tabel Utama (unmatched_main) yang secara GLOBAL memiliki pasangan di PERIODE > X
+    resolved_pairs_list = []
+    if filter_mode == 'UNTIL' and target_period:
+        for idx, row in unmatched_main.iterrows():
+            pair_id = df.loc[row['row_id'], 'matched_pair_id']
+            if pair_id != -1:
+                pair_row = df.loc[pair_id]
+                # Jika pasangannya ada di periode selanjutnya (> target_period)
+                if pair_row['periode_str'] > target_period:
+                    resolved_pairs_list.append({
+                        "Tanggal Jurnal": str(pair_row[col_tgl_jurnal]),
+                        "Kode Periode Pasangan": str(pair_row[col_kode_periode]),
+                        "Nomor Dokumen Pasangan": str(pair_row[col_no_doc]),
+                        "Deskripsi Pasangan": str(pair_row[col_deskripsi]),
+                        "Nilai": format_number_clean(pair_row['nilai_clean']),
+                        "Keterangan Penyelesaian": f"Pasangan Penihil untuk Dok. {row[col_no_doc]} (Periode {row['periode_str']})",
+                        "raw_nilai": pair_row['nilai_clean']
+                    })
 
-        # 1. Main Unmatched: Transaksi s.d periode X yang belum berpasangan sama sekali
-        unmatched_main = df_target_scope[df_target_scope['matched_pair_id'] == -1].copy()
+    # -------------------------------------------------------------
+    # FORMATTING TABEL 1 (UTAMA)
+    # -------------------------------------------------------------
+    if not unmatched_main.empty:
+        unmatched_main['Nilai'] = unmatched_main['nilai_clean'].apply(format_number_clean)
+        total_main = unmatched_main['nilai_clean'].sum()
 
-        # 2. Resolved Later: Transaksi di s.d. periode X yang pasangannya ada di PERIODE > X
-        resolved_later = df_target_scope[
-            (df_target_scope['matched_pair_id'] != -1) & 
-            (df_target_scope['matched_period'] > target_period)
-        ].copy()
-    else:
-        # ALL Mode
-        unmatched_main = df[df['matched_pair_id'] == -1].copy()
-        resolved_later = pd.DataFrame()
-
-    # Formatting Main Unmatched Table
-    unmatched_main['Nilai'] = unmatched_main['nilai_clean'].apply(format_number_clean)
-    total_main = unmatched_main['nilai_clean'].sum() if not unmatched_main.empty else 0.0
-
-    selected_columns = [col_tgl_jurnal, col_kode_periode, col_no_doc, col_deskripsi, 'Nilai']
-    main_df_final = unmatched_main[selected_columns].rename(columns={
-        col_tgl_jurnal: 'Tanggal Jurnal',
-        col_kode_periode: 'Kode Periode',
-        col_no_doc: 'Nomor Dokumen',
-        col_deskripsi: 'Deskripsi'
-    }) if not unmatched_main.empty else pd.DataFrame(columns=['Tanggal Jurnal', 'Kode Periode', 'Nomor Dokumen', 'Deskripsi', 'Nilai'])
-
-    # Formatting Resolved Later Table
-    if not resolved_later.empty:
-        resolved_later['Nilai'] = resolved_later['nilai_clean'].apply(format_number_clean)
-        resolved_later['Penyelesaian'] = resolved_later['matched_period'].apply(lambda x: f"Selesai di Periode {x}")
-        total_resolved = resolved_later['nilai_clean'].sum()
-
-        res_columns = [col_tgl_jurnal, col_kode_periode, col_no_doc, col_deskripsi, 'Nilai', 'Penyelesaian']
-        res_df_final = resolved_later[res_columns].rename(columns={
+        selected_columns = [col_tgl_jurnal, col_kode_periode, col_no_doc, col_deskripsi, 'Nilai']
+        main_df_final = unmatched_main[selected_columns].rename(columns={
             col_tgl_jurnal: 'Tanggal Jurnal',
-            col_kode_periode: 'Kode Periode Transaksi',
+            col_kode_periode: 'Kode Periode',
             col_no_doc: 'Nomor Dokumen',
-            col_deskripsi: 'Deskripsi',
-            'Penyelesaian': 'Keterangan Penyelesaian'
+            col_deskripsi: 'Deskripsi'
         })
+    else:
+        main_df_final = pd.DataFrame(columns=['Tanggal Jurnal', 'Kode Periode', 'Nomor Dokumen', 'Deskripsi', 'Nilai'])
+        total_main = 0.0
+
+    # -------------------------------------------------------------
+    # FORMATTING TABEL 2 (PASANGAN LINTAS PERIODE)
+    # -------------------------------------------------------------
+    if resolved_pairs_list:
+        res_df = pd.DataFrame(resolved_pairs_list)
+        total_resolved = res_df['raw_nilai'].sum()
+        res_df_final = res_df.drop(columns=['raw_nilai'])
     else:
         res_df_final = pd.DataFrame()
         total_resolved = 0.0
@@ -214,11 +222,11 @@ async def home_ui():
     </header>
 
     <!-- Main Container -->
-    <main class="max-w-5xl mx-auto px-6 py-10 w-full flex-grow">
+    <main class="max-w-6xl mx-auto px-6 py-10 w-full flex-grow">
         <!-- Title & Subtitle -->
         <div class="mb-8">
             <h1 class="text-3xl font-extrabold text-white tracking-tight mb-2">Rekonsiliasi Transaksi</h1>
-            <p class="text-sm text-slate-400">Deteksi otomatis transaksi bersisa dan pelacakan penyelesaian lintas periode.</p>
+            <p class="text-sm text-slate-400">Deteksi otomatis transaksi bersisa dan pelacakan pasangan penihil lintas periode.</p>
         </div>
 
         <!-- Upload & Options Section -->
@@ -281,7 +289,7 @@ async def home_ui():
 
         <!-- Results Section -->
         <div id="resultSection" class="hidden space-y-8">
-            <!-- Information Header Card -->
+            <!-- Header Informasi Akun -->
             <div class="bg-card border border-dark rounded-xl p-6 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
                 <div>
                     <span class="text-[10px] font-bold uppercase tracking-widest text-slate-500 block mb-1">Informasi Akun</span>
@@ -295,11 +303,9 @@ async def home_ui():
 
             <!-- TABEL 1: Main Unmatched Table -->
             <div class="bg-card rounded-xl border border-dark overflow-hidden shadow-xl">
-                <div class="p-5 border-b border-dark flex items-center justify-between">
-                    <div>
-                        <h3 class="font-bold text-slate-200 text-sm">Daftar Transaksi Belum Memiliki Pasangan</h3>
-                        <p class="text-xs text-slate-500">Nilai yang masih murni bersisa (unmatched) pada kriteria terfilter.</p>
-                    </div>
+                <div class="p-5 border-b border-dark">
+                    <h3 class="font-bold text-slate-200 text-sm">Daftar Transaksi Belum Memiliki Pasangan</h3>
+                    <p class="text-xs text-slate-500">Nilai yang belum memiliki pasangan penihil pada kriteria periode terpilih.</p>
                 </div>
 
                 <div class="overflow-x-auto max-h-[450px]">
@@ -313,14 +319,14 @@ async def home_ui():
                 </div>
             </div>
 
-            <!-- TABEL 2: Keterangan Penyelesaian (Resolved in Later Periods) -->
+            <!-- TABEL 2: Pasangan Penihil di Periode Selanjutnya -->
             <div id="resolvedSection" class="hidden bg-card rounded-xl border border-dark overflow-hidden shadow-xl">
                 <div class="p-5 border-b border-dark flex items-center justify-between bg-indigo-950/20">
                     <div>
-                        <h3 class="font-bold text-indigo-300 text-sm">Keterangan Penyelesaian (Selesai pada Periode Selanjutnya)</h3>
-                        <p class="text-xs text-slate-400">Transaksi pada rentang periode terpilih yang baru menihilkan/selesai di periode setelahnya.</p>
+                        <h3 class="font-bold text-indigo-300 text-sm">Daftar Pasangan Penihil (Muncul di Periode Selanjutnya)</h3>
+                        <p class="text-xs text-slate-400">Dokumen transaksi di periode selanjutnya yang menjadi pasangan penihil untuk transaksi di atas.</p>
                     </div>
-                    <span class="bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 text-[10px] px-2.5 py-1 rounded-full font-mono">Cross-Period Resolved</span>
+                    <span class="bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 text-[10px] px-2.5 py-1 rounded-full font-mono">Cross-Period Pairs</span>
                 </div>
 
                 <div class="overflow-x-auto max-h-[450px]">
@@ -417,12 +423,12 @@ async def home_ui():
             document.getElementById('displayKodeAkun').innerText = res.kode_akun;
             document.getElementById('displayNamaAkun').innerText = res.nama_akun;
 
-            // Render Table 1: Main Unmatched
-            renderTable('mainTableHeader', 'mainTableBody', 'mainTableFooter', res.main_columns, res.main_data, res.total_nilai_unmatched, false);
+            // Render Table 1
+            renderTable('mainTableHeader', 'mainTableBody', 'mainTableFooter', res.main_columns, res.main_data, res.total_nilai_unmatched);
 
-            // Render Table 2: Resolved Later (jika ada)
+            // Render Table 2 (Tabel Pasangan Penihil)
             if (res.has_resolved_later) {
-                renderTable('resolvedTableHeader', 'resolvedTableBody', 'resolvedTableFooter', res.resolved_columns, res.resolved_data, res.total_nilai_resolved_later, true);
+                renderTable('resolvedTableHeader', 'resolvedTableBody', 'resolvedTableFooter', res.resolved_columns, res.resolved_data, res.total_nilai_resolved_later);
                 resolvedSection.classList.remove('hidden');
             } else {
                 resolvedSection.classList.add('hidden');
@@ -432,7 +438,7 @@ async def home_ui():
             resultSection.classList.remove('hidden');
         }
 
-        function renderTable(headerId, bodyId, footerId, columns, data, totalFormatted, isResolved) {
+        function renderTable(headerId, bodyId, footerId, columns, data, totalFormatted) {
             const headerTr = document.getElementById(headerId);
             const bodyTb = document.getElementById(bodyId);
             const footerTf = document.getElementById(footerId);
@@ -465,10 +471,10 @@ async def home_ui():
 
                     if (col === 'Nilai') {
                         td.innerHTML = `<span class="font-bold text-white font-mono">${row[col]}</span>`;
-                    } else if (col === 'Kode Periode' || col === 'Kode Periode Transaksi') {
+                    } else if (col === 'Kode Periode' || col === 'Kode Periode Pasangan') {
                         td.innerHTML = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-300 font-mono">${row[col]}</span>`;
                     } else if (col === 'Keterangan Penyelesaian') {
-                        td.innerHTML = `<span class="px-2.5 py-1 rounded text-[10px] font-semibold bg-indigo-950/60 text-indigo-300 border border-indigo-800/50 font-mono"><i class="fa-solid fa-circle-check text-indigo-400 mr-1"></i>${row[col]}</span>`;
+                        td.innerHTML = `<span class="px-2.5 py-1 rounded text-[10px] font-semibold bg-indigo-950/60 text-indigo-300 border border-indigo-800/50 font-mono"><i class="fa-solid fa-link text-indigo-400 mr-1"></i>${row[col]}</span>`;
                     } else {
                         td.innerText = row[col] !== null ? row[col] : '';
                     }
