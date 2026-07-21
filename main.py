@@ -211,7 +211,7 @@ async def home_ui():
                     <span class="w-2.5 h-6 bg-[#00d2ff] rounded-sm transform -skew-x-12"></span>
                     <span class="w-2.5 h-6 bg-[#0a84ff] rounded-sm transform -skew-x-12"></span>
                 </div>
-                <span class="font-bold text-lg tracking-tight text-white">dedesaputra <span class="text-slate-400 font-normal">Reconcile</span></span>
+                <span class="font-bold text-lg tracking-tight text-white">dedesaputra <span class="text-slate-400 font-normal">Rekonsiliasi Data</span></span>
             </div>
             <div class="text-xs text-slate-400 flex items-center space-x-4">
                 <span>Projects</span>
