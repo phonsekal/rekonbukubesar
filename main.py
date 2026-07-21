@@ -4,7 +4,7 @@ import pandas as pd
 import io
 import re
 
-app = FastAPI(title="Reconciliation System API & Web UI", version="6.1")
+app = FastAPI(title="Reconciliation System API & Web UI", version="6.2")
 
 def clean_currency(value):
     if pd.isna(value):
@@ -53,7 +53,6 @@ def process_reconciliation(df: pd.DataFrame, filter_mode: str = 'ALL', target_pe
         raise HTTPException(status_code=400, detail="File CSV tidak memiliki setidaknya 12 kolom (s.d. Kolom L).")
 
     # Kolom berdasarkan urutan standar spreadsheet:
-    # C(2): Kode Akun, D(3): Nama Akun, G(6): Tanggal Jurnal, H(7): Kode Periode, I(8): Nomor Dokumen, J(9): Deskripsi, L(11): Nilai
     col_kode_akun = df.columns[2]
     col_nama_akun = df.columns[3]
     col_tgl_jurnal = df.columns[6]
@@ -125,7 +124,6 @@ def process_reconciliation(df: pd.DataFrame, filter_mode: str = 'ALL', target_pe
                         "Tanggal Jurnal": str(pair_row[col_tgl_jurnal]),
                         "Kode Periode Pasangan": str(pair_row[col_kode_periode]),
                         "Nomor Dokumen Pasangan": str(pair_row[col_no_doc]),
-                        "Deskripsi Pasangan": str(pair_row[col_deskripsi]),
                         "target_doc": str(row[col_no_doc]),
                         "target_period": str(row['periode_str']),
                         "nilai_clean": pair_row['nilai_clean']
@@ -147,13 +145,13 @@ def process_reconciliation(df: pd.DataFrame, filter_mode: str = 'ALL', target_pe
         main_df_final = pd.DataFrame(columns=['Tanggal Jurnal', 'Kode Periode', 'Nomor Dokumen', 'Deskripsi', 'Nilai'])
         total_main = 0.0
 
-    # FORMATTING TABEL 2 (AGREGASI / GROUP BY NOMOR DOKUMEN PASANGAN)
+    # FORMATTING TABEL 2 (AGREGASI HANYA BERDASARKAN NOMOR DOKUMEN PASANGAN, DESKRIPSI DIABAIKAN)
     if resolved_pairs_list:
         raw_res_df = pd.DataFrame(resolved_pairs_list)
 
-        # Agregasi data jika Nomor Dokumen Pasangan sama
+        # Groupby murni berdasarkan Nomor Dokumen Pasangan & Kode Periode
         aggregated_res = raw_res_df.groupby(
-            ['Kode Periode Pasangan', 'Nomor Dokumen Pasangan', 'Deskripsi Pasangan'],
+            ['Kode Periode Pasangan', 'Nomor Dokumen Pasangan'],
             as_index=False
         ).agg({
             'Tanggal Jurnal': 'first',
@@ -169,11 +167,11 @@ def process_reconciliation(df: pd.DataFrame, filter_mode: str = 'ALL', target_pe
 
         total_resolved = aggregated_res['nilai_clean'].sum()
 
+        # Kolom tanpa Deskripsi
         res_columns = [
             'Tanggal Jurnal',
             'Kode Periode Pasangan',
             'Nomor Dokumen Pasangan',
-            'Deskripsi Pasangan',
             'Nilai',
             'Keterangan Penyelesaian'
         ]
@@ -239,16 +237,14 @@ async def home_ui():
 
     <!-- Main Container -->
     <main class="max-w-6xl mx-auto px-6 py-10 w-full flex-grow">
-        <!-- Title & Subtitle -->
         <div class="mb-8">
             <h1 class="text-3xl font-extrabold text-white tracking-tight mb-2">Rekonsiliasi Transaksi</h1>
-            <p class="text-sm text-slate-400">Deteksi otomatis transaksi bersisa dan penggabungan pasangan penihil lintas periode.</p>
+            <p class="text-sm text-slate-400">Deteksi otomatis transaksi bersisa dan penggabungan akumulasi pasangan penihil.</p>
         </div>
 
-        <!-- Upload & Options Section -->
+        <!-- Upload Section -->
         <div id="uploadSection" class="bg-card rounded-2xl border border-dark p-8 mb-8 shadow-xl">
             <form id="uploadForm" class="space-y-6">
-                <!-- Options Filter Periode -->
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 bg-[#0b0f17] p-4 rounded-xl border border-dark">
                     <div>
                         <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
@@ -283,7 +279,6 @@ async def home_ui():
                     </div>
                 </div>
 
-                <!-- Drop Zone -->
                 <div id="dropZone" class="border border-dashed border-slate-700 rounded-xl p-10 transition-all hover:border-[#00d2ff] hover:bg-[#0b0f17]/50 cursor-pointer flex flex-col items-center justify-center text-center">
                     <input type="file" id="csvFile" name="file" accept=".csv" class="hidden">
                     <i class="fa-solid fa-cloud-arrow-up text-3xl brand-cyan mb-3"></i>
@@ -335,12 +330,12 @@ async def home_ui():
                 </div>
             </div>
 
-            <!-- TABEL 2: Pasangan Penihil di Periode Selanjutnya (Digabungkan) -->
+            <!-- TABEL 2: Pasangan Penihil (Digabungkan per Nomor Dokumen) -->
             <div id="resolvedSection" class="hidden bg-card rounded-xl border border-dark overflow-hidden shadow-xl">
                 <div class="p-5 border-b border-dark flex items-center justify-between bg-indigo-950/20">
                     <div>
                         <h3 class="font-bold text-indigo-300 text-sm">Daftar Pasangan Penihil (Muncul di Periode Selanjutnya)</h3>
-                        <p class="text-xs text-slate-400">Dokumen transaksi di periode selanjutnya yang menjadi pasangan penihil (Nomor dokumen sama telah dijumlahkan).</p>
+                        <p class="text-xs text-slate-400">Total akumulasi dokumen penihil di periode selanjutnya (Nomor dokumen sama telah digabung).</p>
                     </div>
                     <span class="bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 text-[10px] px-2.5 py-1 rounded-full font-mono">Aggregated Pairs</span>
                 </div>
