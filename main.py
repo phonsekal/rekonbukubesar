@@ -4,7 +4,7 @@ import pandas as pd
 import io
 import re
 
-app = FastAPI(title="Reconciliation System API & Web UI", version="6.0")
+app = FastAPI(title="Reconciliation System API & Web UI", version="6.1")
 
 def clean_currency(value):
     if pd.isna(value):
@@ -71,13 +71,11 @@ def process_reconciliation(df: pd.DataFrame, filter_mode: str = 'ALL', target_pe
     df['nilai_clean'] = df[col_l_name].apply(clean_currency)
     df['abs_val'] = df['nilai_clean'].abs()
 
-    # Sort berdasarkan Periode untuk memastikan pencocokan kronologis
+    # Sort berdasarkan Periode
     df = df.sort_values(by='periode_str').reset_index(drop=True)
     df['row_id'] = df.index
 
-    # -------------------------------------------------------------
-    # 1. PENCOCOKAN DALAM SKOP CAKUPAN (Scope Matching) -> Untuk Tabel Utama
-    # -------------------------------------------------------------
+    # 1. PENCOCOKAN DALAM SKOP CAKUPAN PERIODE (Tabel Utama)
     if filter_mode == 'EXACT' and target_period:
         scope_df = df[df['periode_str'] == target_period].copy()
     elif filter_mode == 'UNTIL' and target_period:
@@ -98,12 +96,9 @@ def process_reconciliation(df: pd.DataFrame, filter_mode: str = 'ALL', target_pe
             scope_df.loc[pos_indices[i], 'matched_in_scope'] = True
             scope_df.loc[neg_indices[i], 'matched_in_scope'] = True
 
-    # Main Unmatched = Semua baris yang belum dapat pasangan DI DALAM SKOP PERIODE TERPILIH
     unmatched_main = scope_df[~scope_df['matched_in_scope']].copy()
 
-    # -------------------------------------------------------------
-    # 2. PENCOCOKAN GLOBAL (Seluruh Periode) -> Untuk Tabel Pasangan Lintas Periode
-    # -------------------------------------------------------------
+    # 2. PENCOCOKAN GLOBAL (Mencari Pasangan Penihil)
     df['matched_pair_id'] = -1
     for abs_val, group in df.groupby('abs_val'):
         if abs_val == 0:
@@ -118,28 +113,25 @@ def process_reconciliation(df: pd.DataFrame, filter_mode: str = 'ALL', target_pe
             df.loc[p_idx, 'matched_pair_id'] = n_idx
             df.loc[n_idx, 'matched_pair_id'] = p_idx
 
-    # Cari transaksi di Tabel Utama (unmatched_main) yang secara GLOBAL memiliki pasangan di PERIODE > X
+    # Kumpulkan Pasangan Lintas Periode
     resolved_pairs_list = []
     if filter_mode == 'UNTIL' and target_period:
         for idx, row in unmatched_main.iterrows():
             pair_id = df.loc[row['row_id'], 'matched_pair_id']
             if pair_id != -1:
                 pair_row = df.loc[pair_id]
-                # Jika pasangannya ada di periode selanjutnya (> target_period)
                 if pair_row['periode_str'] > target_period:
                     resolved_pairs_list.append({
                         "Tanggal Jurnal": str(pair_row[col_tgl_jurnal]),
                         "Kode Periode Pasangan": str(pair_row[col_kode_periode]),
                         "Nomor Dokumen Pasangan": str(pair_row[col_no_doc]),
                         "Deskripsi Pasangan": str(pair_row[col_deskripsi]),
-                        "Nilai": format_number_clean(pair_row['nilai_clean']),
-                        "Keterangan Penyelesaian": f"Pasangan Penihil untuk Dok. {row[col_no_doc]} (Periode {row['periode_str']})",
-                        "raw_nilai": pair_row['nilai_clean']
+                        "target_doc": str(row[col_no_doc]),
+                        "target_period": str(row['periode_str']),
+                        "nilai_clean": pair_row['nilai_clean']
                     })
 
-    # -------------------------------------------------------------
     # FORMATTING TABEL 1 (UTAMA)
-    # -------------------------------------------------------------
     if not unmatched_main.empty:
         unmatched_main['Nilai'] = unmatched_main['nilai_clean'].apply(format_number_clean)
         total_main = unmatched_main['nilai_clean'].sum()
@@ -155,13 +147,37 @@ def process_reconciliation(df: pd.DataFrame, filter_mode: str = 'ALL', target_pe
         main_df_final = pd.DataFrame(columns=['Tanggal Jurnal', 'Kode Periode', 'Nomor Dokumen', 'Deskripsi', 'Nilai'])
         total_main = 0.0
 
-    # -------------------------------------------------------------
-    # FORMATTING TABEL 2 (PASANGAN LINTAS PERIODE)
-    # -------------------------------------------------------------
+    # FORMATTING TABEL 2 (AGREGASI / GROUP BY NOMOR DOKUMEN PASANGAN)
     if resolved_pairs_list:
-        res_df = pd.DataFrame(resolved_pairs_list)
-        total_resolved = res_df['raw_nilai'].sum()
-        res_df_final = res_df.drop(columns=['raw_nilai'])
+        raw_res_df = pd.DataFrame(resolved_pairs_list)
+
+        # Agregasi data jika Nomor Dokumen Pasangan sama
+        aggregated_res = raw_res_df.groupby(
+            ['Kode Periode Pasangan', 'Nomor Dokumen Pasangan', 'Deskripsi Pasangan'],
+            as_index=False
+        ).agg({
+            'Tanggal Jurnal': 'first',
+            'nilai_clean': 'sum',
+            'target_doc': lambda x: ', '.join(sorted(set(x))),
+            'target_period': 'first'
+        })
+
+        aggregated_res['Nilai'] = aggregated_res['nilai_clean'].apply(format_number_clean)
+        aggregated_res['Keterangan Penyelesaian'] = aggregated_res.apply(
+            lambda r: f"Pasangan Penihil Dok. {r['target_doc']} (Periode {r['target_period']})", axis=1
+        )
+
+        total_resolved = aggregated_res['nilai_clean'].sum()
+
+        res_columns = [
+            'Tanggal Jurnal',
+            'Kode Periode Pasangan',
+            'Nomor Dokumen Pasangan',
+            'Deskripsi Pasangan',
+            'Nilai',
+            'Keterangan Penyelesaian'
+        ]
+        res_df_final = aggregated_res[res_columns]
     else:
         res_df_final = pd.DataFrame()
         total_resolved = 0.0
@@ -211,7 +227,7 @@ async def home_ui():
                     <span class="w-2.5 h-6 bg-[#00d2ff] rounded-sm transform -skew-x-12"></span>
                     <span class="w-2.5 h-6 bg-[#0a84ff] rounded-sm transform -skew-x-12"></span>
                 </div>
-                <span class="font-bold text-lg tracking-tight text-white">dedesaputra <span class="text-slate-400 font-normal">Rekonsiliasi Data</span></span>
+                <span class="font-bold text-lg tracking-tight text-white">dedesaputra <span class="text-slate-400 font-normal">Reconcile</span></span>
             </div>
             <div class="text-xs text-slate-400 flex items-center space-x-4">
                 <span>Projects</span>
@@ -226,7 +242,7 @@ async def home_ui():
         <!-- Title & Subtitle -->
         <div class="mb-8">
             <h1 class="text-3xl font-extrabold text-white tracking-tight mb-2">Rekonsiliasi Transaksi</h1>
-            <p class="text-sm text-slate-400">Deteksi otomatis transaksi bersisa dan pelacakan pasangan penihil lintas periode.</p>
+            <p class="text-sm text-slate-400">Deteksi otomatis transaksi bersisa dan penggabungan pasangan penihil lintas periode.</p>
         </div>
 
         <!-- Upload & Options Section -->
@@ -319,14 +335,14 @@ async def home_ui():
                 </div>
             </div>
 
-            <!-- TABEL 2: Pasangan Penihil di Periode Selanjutnya -->
+            <!-- TABEL 2: Pasangan Penihil di Periode Selanjutnya (Digabungkan) -->
             <div id="resolvedSection" class="hidden bg-card rounded-xl border border-dark overflow-hidden shadow-xl">
                 <div class="p-5 border-b border-dark flex items-center justify-between bg-indigo-950/20">
                     <div>
                         <h3 class="font-bold text-indigo-300 text-sm">Daftar Pasangan Penihil (Muncul di Periode Selanjutnya)</h3>
-                        <p class="text-xs text-slate-400">Dokumen transaksi di periode selanjutnya yang menjadi pasangan penihil untuk transaksi di atas.</p>
+                        <p class="text-xs text-slate-400">Dokumen transaksi di periode selanjutnya yang menjadi pasangan penihil (Nomor dokumen sama telah dijumlahkan).</p>
                     </div>
-                    <span class="bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 text-[10px] px-2.5 py-1 rounded-full font-mono">Cross-Period Pairs</span>
+                    <span class="bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 text-[10px] px-2.5 py-1 rounded-full font-mono">Aggregated Pairs</span>
                 </div>
 
                 <div class="overflow-x-auto max-h-[450px]">
@@ -426,7 +442,7 @@ async def home_ui():
             // Render Table 1
             renderTable('mainTableHeader', 'mainTableBody', 'mainTableFooter', res.main_columns, res.main_data, res.total_nilai_unmatched);
 
-            // Render Table 2 (Tabel Pasangan Penihil)
+            // Render Table 2
             if (res.has_resolved_later) {
                 renderTable('resolvedTableHeader', 'resolvedTableBody', 'resolvedTableFooter', res.resolved_columns, res.resolved_data, res.total_nilai_resolved_later);
                 resolvedSection.classList.remove('hidden');
