@@ -1,16 +1,12 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse, HTMLResponse
 import pandas as pd
 import io
 import re
 
-app = FastAPI(title="Reconciliation System API & Web UI", version="2.0")
+app = FastAPI(title="Reconciliation System API & Web UI", version="3.0")
 
 def clean_currency(value):
-    """
-    Mengubah format teks/accounting seperti '(156.000.000)', '-156.000.000', atau '156.000.000'
-    menjadi float murni (-156000000.0 atau 156000000.0).
-    """
     if pd.isna(value):
         return 0.0
     if isinstance(value, (int, float)):
@@ -20,7 +16,6 @@ def clean_currency(value):
     if not val_str:
         return 0.0
     
-    # Deteksi format negatif dengan kurung: (123.456) -> -123.456
     is_negative = False
     if val_str.startswith('(') and val_str.endswith(')'):
         is_negative = True
@@ -29,10 +24,8 @@ def clean_currency(value):
         is_negative = True
         val_str = val_str[1:]
     
-    # Hapus pemisah ribuan & penanda mata uang
     val_str = re.sub(r'[^0-9,\.]', '', val_str)
     
-    # Parsing pemisah ribuan/desimal
     if '.' in val_str and ',' in val_str:
         val_str = val_str.replace('.', '').replace(',', '.')
     elif '.' in val_str:
@@ -48,21 +41,54 @@ def clean_currency(value):
     except ValueError:
         return 0.0
 
-def process_reconciliation(df: pd.DataFrame):
-    if df.shape[1] < 12:
-        raise HTTPException(status_code=400, detail="File CSV tidak memiliki setidaknya 12 kolom (Kolom L).")
+def format_rupiah(val: float) -> str:
+    if val < 0:
+        return f"Rp ({abs(val):,.2f})".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"Rp {val:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
+def process_reconciliation(df: pd.DataFrame, filter_mode: str = 'ALL', target_period: str = ''):
+    if df.shape[1] < 12:
+        raise HTTPException(status_code=400, detail="File CSV tidak memiliki setidaknya 12 kolom (s.d. Kolom L).")
+
+    # Kolom berdasarkan urutan standar spreadsheet:
+    # C(2): Kode Akun, D(3): Nama Akun, G(6): Tanggal Jurnal, H(7): Kode Periode, I(8): Nomor Dokumen, J(9): Deskripsi, L(11): Nilai
+    col_kode_akun = df.columns[2]
+    col_nama_akun = df.columns[3]
+    col_tgl_jurnal = df.columns[6]
+    col_kode_periode = df.columns[7]
+    col_no_doc = df.columns[8]
+    col_deskripsi = df.columns[9]
     col_l_name = df.columns[11]
+
+    # Format Kode Periode sebagai String
+    df['periode_str'] = df[col_kode_periode].astype(str).str.strip()
+
+    # Filter Periode sebelum Rekonsiliasi
+    if target_period and filter_mode != 'ALL':
+        if filter_mode == 'EXACT':
+            df = df[df['periode_str'] == target_period].copy()
+        elif filter_mode == 'UNTIL':
+            df = df[df['periode_str'] <= target_period].copy()
+
+    if df.empty:
+        return {
+            "total_rows": 0,
+            "total_unmatched": 0,
+            "total_surplus_unmatched": 0,
+            "total_deficit_unmatched": 0,
+            "columns": ['Kode Akun', 'Nama Akun', 'Tanggal Jurnal', 'Kode Periode', 'Nomor Dokumen', 'Deskripsi', 'Nilai (Rupiah)', 'Status', 'Keterangan Detail'],
+            "data": []
+        }
 
     # Clean & Absolute Values
     df['nilai_clean'] = df[col_l_name].apply(clean_currency)
     df['abs_val'] = df['nilai_clean'].abs()
 
-    # Siapkan kolom penanda
+    # Penanda awal
     df['Status_Rekonsiliasi'] = 'MATCHED'
     df['Keterangan'] = 'Memiliki Pasangan'
 
-    # Algoritma Matching per Nilai Mutlak (1-to-1 Matching)
+    # Algoritma Matching 1-to-1
     for abs_val, group in df.groupby('abs_val'):
         if abs_val == 0:
             continue
@@ -87,20 +113,44 @@ def process_reconciliation(df: pd.DataFrame):
             df.loc[unmatched_neg, 'Keterangan'] = f'Kelebihan Nilai Negatif (Total (+): {len_pos}, Total (-): {len_neg})'
 
     unmatched_df = df[df['Status_Rekonsiliasi'] != 'MATCHED'].copy()
-    unmatched_df = unmatched_df.drop(columns=['nilai_clean', 'abs_val'])
+    unmatched_df['Nilai (Rupiah)'] = unmatched_df['nilai_clean'].apply(format_rupiah)
+
+    selected_columns = [
+        col_kode_akun,
+        col_nama_akun,
+        col_tgl_jurnal,
+        col_kode_periode,
+        col_no_doc,
+        col_deskripsi,
+        'Nilai (Rupiah)',
+        'Status_Rekonsiliasi',
+        'Keterangan'
+    ]
+
+    final_df = unmatched_df[selected_columns].copy()
+
+    final_df = final_df.rename(columns={
+        col_kode_akun: 'Kode Akun',
+        col_nama_akun: 'Nama Akun',
+        col_tgl_jurnal: 'Tanggal Jurnal',
+        col_kode_periode: 'Kode Periode',
+        col_no_doc: 'Nomor Dokumen',
+        col_deskripsi: 'Deskripsi',
+        'Status_Rekonsiliasi': 'Status',
+        'Keterangan': 'Keterangan Detail'
+    })
 
     return {
         "total_rows": len(df),
-        "total_unmatched": len(unmatched_df),
+        "total_unmatched": len(final_df),
         "total_surplus_unmatched": len(df[df['Status_Rekonsiliasi'] == 'UNMATCHED_SURPLUS']),
         "total_deficit_unmatched": len(df[df['Status_Rekonsiliasi'] == 'UNMATCHED_DEFICIT']),
-        "columns": list(unmatched_df.columns),
-        "data": unmatched_df.fillna("").to_dict(orient='records')
+        "columns": list(final_df.columns),
+        "data": final_df.fillna("").to_dict(orient='records')
     }
 
 @app.get("/", response_class=HTMLResponse)
 async def home_ui():
-    """Halaman Antarmuka / Web UI Interaktif"""
     html_content = """<!DOCTYPE html>
 <html lang="id">
 <head>
@@ -111,40 +161,78 @@ async def home_ui():
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
 </head>
 <body class="bg-slate-50 text-slate-800 min-h-screen font-sans">
-    <header class="bg-slate-900 text-white py-5 shadow-md">
+    <header class="bg-slate-900 text-white py-6 shadow-md border-b border-slate-800">
         <div class="max-w-7xl mx-auto px-6 flex items-center justify-between">
             <div class="flex items-center space-x-3">
-                <div class="bg-indigo-600 text-white p-2.5 rounded-xl">
+                <div class="bg-indigo-600 text-white p-2.5 rounded-xl shadow-md">
                     <i class="fa-solid fa-scale-balanced text-xl"></i>
                 </div>
                 <div>
                     <h1 class="text-xl font-bold tracking-wide">ReconcilePro CSV</h1>
-                    <p class="text-xs text-slate-400">Deteksi Otomatis Transaksi Tanpa Pasangan (Kolom L)</p>
+                    <p class="text-xs text-slate-400">Deteksi Transaksi Tanpa Pasangan dengan Filter Periode</p>
                 </div>
             </div>
-            <span class="bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-xs px-3 py-1 rounded-full font-medium">FastAPI Engine v2.0</span>
+            <span class="bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-xs px-3 py-1 rounded-full font-medium">FastAPI Engine v3.0</span>
         </div>
     </header>
 
     <main class="max-w-7xl mx-auto px-6 py-8">
         <!-- Hero & Upload Section -->
-        <div id="uploadSection" class="bg-white rounded-2xl shadow-sm border border-slate-200 p-8 mb-8 text-center">
-            <div class="max-w-xl mx-auto">
-                <div class="w-16 h-16 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center mx-auto mb-4 border border-indigo-100 shadow-inner">
-                    <i class="fa-solid fa-file-csv text-2xl"></i>
+        <div id="uploadSection" class="bg-white rounded-2xl shadow-sm border border-slate-200 p-8 mb-8">
+            <div class="max-w-2xl mx-auto">
+                <div class="text-center mb-6">
+                    <div class="w-16 h-16 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center mx-auto mb-4 border border-indigo-100 shadow-inner">
+                        <i class="fa-solid fa-file-csv text-2xl"></i>
+                    </div>
+                    <h2 class="text-2xl font-bold text-slate-900 mb-2">Unggah File CSV Rekonsiliasi</h2>
+                    <p class="text-sm text-slate-500">Pilih opsi filter periode (Opsional) sebelum mengunggah dan menganalisis data.</p>
                 </div>
-                <h2 class="text-2xl font-bold text-slate-900 mb-2">Unggah File CSV Rekonsiliasi</h2>
-                <p class="text-sm text-slate-500 mb-6">Pilih file CSV yang akan direkonsiliasi. Sistem akan mencocokkan nilai positif & negatif pada <b>Kolom L</b> secara 1-to-1 dan menampilkan sisa yang tidak berpasangan.</p>
                 
-                <form id="uploadForm" class="space-y-4">
+                <form id="uploadForm" class="space-y-6">
+                    <!-- Options Filter Periode -->
+                    <div class="bg-slate-50 p-5 rounded-xl border border-slate-200 grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-2">
+                                <i class="fa-solid fa-filter text-indigo-500 mr-1"></i> Mode Filter Periode
+                            </label>
+                            <select id="filterMode" name="filter_mode" class="w-full bg-white border border-slate-300 text-slate-800 text-xs rounded-lg p-2.5 focus:ring-indigo-500 focus:border-indigo-500 font-medium">
+                                <option value="ALL">Semua Periode (Tanpa Filter)</option>
+                                <option value="EXACT">Hanya Periode X</option>
+                                <option value="UNTIL">Sampai Dengan (s.d.) Periode X</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-2">
+                                <i class="fa-solid fa-calendar-days text-indigo-500 mr-1"></i> Pilih Periode X
+                            </label>
+                            <select id="targetPeriod" name="target_period" disabled class="w-full bg-slate-100 border border-slate-300 text-slate-800 text-xs rounded-lg p-2.5 focus:ring-indigo-500 focus:border-indigo-500 font-medium disabled:opacity-50">
+                                <option value="">-- Pilih Periode --</option>
+                                <option value="2026-01">2026-01</option>
+                                <option value="2026-02">2026-02</option>
+                                <option value="2026-03">2026-03</option>
+                                <option value="2026-04">2026-04</option>
+                                <option value="2026-05">2026-05</option>
+                                <option value="2026-06">2026-06</option>
+                                <option value="2026-07">2026-07</option>
+                                <option value="2026-08">2026-08</option>
+                                <option value="2026-09">2026-09</option>
+                                <option value="2026-10">2026-10</option>
+                                <option value="2026-11">2026-11</option>
+                                <option value="2026-12">2026-12</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Drop Zone -->
                     <div id="dropZone" class="border-2 border-dashed border-slate-300 rounded-xl p-8 transition-all hover:border-indigo-500 hover:bg-slate-50/50 cursor-pointer flex flex-col items-center justify-center">
                         <input type="file" id="csvFile" name="file" accept=".csv" class="hidden">
                         <i class="fa-solid fa-cloud-arrow-up text-3xl text-slate-400 mb-3"></i>
-                        <p class="text-sm font-semibold text-slate-700" id="fileLabel">Klik untuk memilih file CSV</p>
+                        <p class="text-sm font-semibold text-slate-700" id="fileLabel">Klik untuk memilih file CSV atau seret ke sini</p>
                         <p class="text-xs text-slate-400 mt-1">Format didukung: .csv (Pemisah koma atau titik koma)</p>
                     </div>
 
-                    <button type="submit" id="btnSubmit" disabled class="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white font-semibold py-3 px-6 rounded-xl transition-all shadow-md flex items-center justify-center space-x-2 disabled:cursor-not-allowed">
+                    <button type="submit" id="btnSubmit" disabled class="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white font-semibold py-3 px-6 rounded-xl transition-all shadow-md hover:shadow-indigo-200 flex items-center justify-center space-x-2 disabled:cursor-not-allowed">
                         <i class="fa-solid fa-bolt"></i>
                         <span>Proses & Analisis Data</span>
                     </button>
@@ -181,14 +269,16 @@ async def home_ui():
 
             <!-- Table Card -->
             <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-                <div class="p-6 border-b border-slate-100 flex items-center justify-between">
+                <div class="p-6 border-b border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                     <div>
-                        <h3 class="font-bold text-slate-900 text-lg">Daftar Transaksi Tanpa Pasangan</h3>
-                        <p class="text-xs text-slate-500">Baris di bawah adalah transaksi yang bernilai tunggal atau melebihi kuantitas pasangannya.</p>
+                        <h3 class="font-bold text-slate-900 text-lg">Hasil Rekonsiliasi Transaksi Tanpa Pasangan</h3>
+                        <p class="text-xs text-slate-500" id="filterSummary">Menampilkan Ringkasan Kolom Utama Termasuk Kode Periode (Kolom H).</p>
                     </div>
-                    <button id="btnReset" class="text-xs font-semibold px-4 py-2 border border-slate-300 rounded-lg hover:bg-slate-50 text-slate-700">
-                        <i class="fa-solid fa-arrow-left mr-1"></i> Upload File Lain
-                    </button>
+                    <div class="flex items-center gap-3">
+                        <button id="btnReset" class="text-xs font-semibold px-4 py-2 border border-slate-300 rounded-lg hover:bg-slate-50 text-slate-700">
+                            <i class="fa-solid fa-arrow-left mr-1"></i> Upload File Lain
+                        </button>
+                    </div>
                 </div>
 
                 <div class="overflow-x-auto max-h-[550px]">
@@ -212,6 +302,20 @@ async def home_ui():
         const loading = document.getElementById('loading');
         const uploadSection = document.getElementById('uploadSection');
         const resultSection = document.getElementById('resultSection');
+        const filterMode = document.getElementById('filterMode');
+        const targetPeriod = document.getElementById('targetPeriod');
+
+        filterMode.addEventListener('change', () => {
+            if (filterMode.value === 'ALL') {
+                targetPeriod.disabled = true;
+                targetPeriod.classList.add('bg-slate-100');
+                targetPeriod.classList.remove('bg-white');
+            } else {
+                targetPeriod.disabled = false;
+                targetPeriod.classList.remove('bg-slate-100');
+                targetPeriod.classList.add('bg-white');
+            }
+        });
 
         dropZone.addEventListener('click', () => csvFileInput.click());
 
@@ -226,8 +330,15 @@ async def home_ui():
             e.preventDefault();
             if (!csvFileInput.files[0]) return;
 
+            if (filterMode.value !== 'ALL' && !targetPeriod.value) {
+                alert("Silakan pilih Periode X terlebih dahulu!");
+                return;
+            }
+
             const formData = new FormData();
             formData.append('file', csvFileInput.files[0]);
+            formData.append('filter_mode', filterMode.value);
+            formData.append('target_period', targetPeriod.value);
 
             loading.classList.remove('hidden');
             btnSubmit.disabled = true;
@@ -267,7 +378,7 @@ async def home_ui():
             bodyTb.innerHTML = '';
 
             if (res.data.length === 0) {
-                bodyTb.innerHTML = `<tr><td colspan="100%" class="text-center py-8 text-emerald-600 font-medium">Semua transaksi pada kolom L saling menihilkan (100% Matched)!</td></tr>`;
+                bodyTb.innerHTML = `<tr><td colspan="100%" class="text-center py-8 text-emerald-600 font-medium">Tidak ada transaksi tanpa pasangan yang ditemukan untuk kriteria ini.</td></tr>`;
             } else {
                 res.columns.forEach(col => {
                     const th = document.createElement('th');
@@ -278,16 +389,20 @@ async def home_ui():
 
                 res.data.forEach(row => {
                     const tr = document.createElement('tr');
-                    tr.className = row.Status_Rekonsiliasi === 'UNMATCHED_SURPLUS' ? 'bg-emerald-50/40 hover:bg-emerald-50' : 'bg-rose-50/40 hover:bg-rose-50';
+                    tr.className = row.Status === 'UNMATCHED_SURPLUS' ? 'bg-emerald-50/40 hover:bg-emerald-50' : 'bg-rose-50/40 hover:bg-rose-50';
 
                     res.columns.forEach(col => {
                         const td = document.createElement('td');
                         td.className = "py-2.5 px-4 whitespace-nowrap border-b border-slate-100";
                         
-                        if (col === 'Status_Rekonsiliasi') {
+                        if (col === 'Status') {
                             const badgeColor = row[col] === 'UNMATCHED_SURPLUS' ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800';
                             td.innerHTML = `<span class="px-2 py-0.5 rounded text-[10px] font-bold ${badgeColor}">${row[col]}</span>`;
-                        } else if (col === 'Keterangan') {
+                        } else if (col === 'Nilai (Rupiah)') {
+                            td.innerHTML = `<span class="font-bold text-slate-900 font-mono">${row[col]}</span>`;
+                        } else if (col === 'Kode Periode') {
+                            td.innerHTML = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-200 text-slate-800 font-mono">${row[col]}</span>`;
+                        } else if (col === 'Keterangan Detail') {
                             td.innerHTML = `<span class="font-medium text-slate-700">${row[col]}</span>`;
                         } else {
                             td.innerText = row[col] !== null ? row[col] : '';
@@ -304,7 +419,7 @@ async def home_ui():
 
         document.getElementById('btnReset').addEventListener('click', () => {
             csvFileInput.value = '';
-            fileLabel.innerHTML = 'Klik untuk memilih file CSV';
+            fileLabel.innerHTML = 'Klik untuk memilih file CSV atau seret ke sini';
             btnSubmit.disabled = true;
             resultSection.classList.add('hidden');
             uploadSection.classList.remove('hidden');
@@ -315,14 +430,17 @@ async def home_ui():
     return HTMLResponse(content=html_content)
 
 @app.post("/reconcile-csv/")
-async def reconcile_csv(file: UploadFile = File(...)):
+async def reconcile_csv(
+    file: UploadFile = File(...),
+    filter_mode: str = Form("ALL"),
+    target_period: str = Form("")
+):
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="File harus berformat CSV (.csv)")
 
     try:
         contents = await file.read()
         
-        # Otomatisasi deteksi separator koma (,) atau titik-koma (;)
         try:
             df = pd.read_csv(io.BytesIO(contents), encoding='utf-8')
             if df.shape[1] < 5:
@@ -330,7 +448,7 @@ async def reconcile_csv(file: UploadFile = File(...)):
         except Exception:
             df = pd.read_csv(io.BytesIO(contents), encoding='latin1', sep=None, engine='python')
 
-        return JSONResponse(content=process_reconciliation(df))
+        return JSONResponse(content=process_reconciliation(df, filter_mode, target_period))
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gagal memproses CSV: {str(e)}")
